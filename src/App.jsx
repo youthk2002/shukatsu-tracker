@@ -1,402 +1,529 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
+import {
+  ComposedChart, LineChart, BarChart,
+  Line, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine, Area, AreaChart
+} from "recharts";
 
-const STATUS_OPTIONS = ["未着手", "ES作成中", "ES提出済", "書類選考中", "面接準備中", "一次面接", "二次面接", "最終面接", "内定", "不合格", "辞退"];
+const API_KEY = "XXQUC0AKT8UAFQFJ";
 
-const STATUS_COLORS = {
-  "未着手": "#94a3b8", "ES作成中": "#f59e0b", "ES提出済": "#3b82f6",
-  "書類選考中": "#8b5cf6", "面接準備中": "#06b6d4", "一次面接": "#10b981",
-  "二次面接": "#059669", "最終面接": "#0d9488", "内定": "#16a34a",
-  "不合格": "#ef4444", "辞退": "#6b7280",
-};
-
-const PHASES = [
-  { key: "summer", label: "夏インターン", color: "#f97316" },
-  { key: "winter", label: "冬インターン", color: "#0ea5e9" },
-  { key: "honsen", label: "本選考",       color: "#8b5cf6" },
+const PERIODS = [
+  { label: "1週",   av: "TIME_SERIES_DAILY", outputsize: "compact", days: 7   },
+  { label: "1ヶ月", av: "TIME_SERIES_DAILY", outputsize: "compact", days: 30  },
+  { label: "3ヶ月", av: "TIME_SERIES_DAILY", outputsize: "compact", days: 90  },
+  { label: "6ヶ月", av: "TIME_SERIES_DAILY", outputsize: "full",    days: 180 },
+  { label: "1年",   av: "TIME_SERIES_DAILY", outputsize: "full",    days: 365 },
 ];
 
-const EMPTY_PHASE = { esDeadline: "", briefingDate: "", status: "未着手", memo: "" };
-const EMPTY_FORM  = { company: "", summer: {...EMPTY_PHASE}, winter: {...EMPTY_PHASE}, honsen: {...EMPTY_PHASE} };
+const PRESETS = [
+  { label: "トヨタ",     symbol: "7203.T", market: "JP", name: "トヨタ自動車" },
+  { label: "ソニー",     symbol: "6758.T", market: "JP", name: "ソニーグループ" },
+  { label: "任天堂",     symbol: "7974.T", market: "JP", name: "任天堂" },
+  { label: "三菱UFJ",   symbol: "8306.T", market: "JP", name: "三菱UFJフィナンシャル" },
+  { label: "Apple",     symbol: "AAPL",   market: "US", name: "Apple Inc." },
+  { label: "NVIDIA",    symbol: "NVDA",   market: "US", name: "NVIDIA Corporation" },
+  { label: "Tesla",     symbol: "TSLA",   market: "US", name: "Tesla, Inc." },
+  { label: "Microsoft", symbol: "MSFT",   market: "US", name: "Microsoft Corporation" },
+];
 
-const WEEKDAYS = ["日","月","火","水","木","金","土"];
+const PANELS = [
+  { key: "macd",  label: "MACD",             color: "#3b82f6" },
+  { key: "bb",    label: "ボリンジャー",      color: "#8b5cf6" },
+  { key: "vol",   label: "出来高",            color: "#10b981" },
+  { key: "stoch", label: "ストキャスティクス", color: "#f97316" },
+  { key: "rsi",   label: "RSI",               color: "#06b6d4" },
+];
 
-function formatDate(d) {
-  if (!d) return "―";
-  const dt = new Date(d);
-  return `${dt.getMonth()+1}/${dt.getDate()}`;
+// ── テクニカル計算 ──────────────────────────────────────
+function calcMA(data, n) {
+  return data.map((d, i) => ({
+    ...d,
+    [`ma${n}`]: i < n-1 ? null : parseFloat((data.slice(i-n+1,i+1).reduce((s,x)=>s+x.close,0)/n).toFixed(2)),
+  }));
 }
-function daysUntil(d) {
-  if (!d) return null;
-  const today = new Date(); today.setHours(0,0,0,0);
-  return Math.ceil((new Date(d) - today) / 86400000);
+function calcBB(data, n=20) {
+  return data.map((d,i) => {
+    if (i < n-1) return {...d, bbUpper:null, bbLower:null, bbMid:null};
+    const sl = data.slice(i-n+1,i+1).map(x=>x.close);
+    const mean = sl.reduce((s,v)=>s+v,0)/n;
+    const std  = Math.sqrt(sl.reduce((s,v)=>s+(v-mean)**2,0)/n);
+    return {...d, bbUpper:parseFloat((mean+2*std).toFixed(2)), bbLower:parseFloat((mean-2*std).toFixed(2)), bbMid:parseFloat(mean.toFixed(2))};
+  });
 }
-function toYMD(dateObj) {
-  return `${dateObj.getFullYear()}-${String(dateObj.getMonth()+1).padStart(2,"0")}-${String(dateObj.getDate()).padStart(2,"0")}`;
+function calcMACD(data, fast=12, slow=26, sig=9) {
+  function ema(arr, n) {
+    const k=2/(n+1); let e=arr[0];
+    return arr.map((v,i)=>{ if(i===0)return e; e=v*k+e*(1-k); return e; });
+  }
+  const closes=data.map(d=>d.close);
+  const ef=ema(closes,fast), es=ema(closes,slow);
+  const ml=ef.map((v,i)=>v-es[i]);
+  const sg=ema(ml,sig);
+  return data.map((d,i)=>({
+    ...d,
+    macd:     i<slow-1   ? null : parseFloat(ml[i].toFixed(3)),
+    macdSig:  i<slow+sig-2? null : parseFloat(sg[i].toFixed(3)),
+    macdHist: i<slow+sig-2? null : parseFloat((ml[i]-sg[i]).toFixed(3)),
+  }));
+}
+function calcRSI(data, n=14) {
+  return data.map((d,i) => {
+    if (i<n) return {...d, rsi:null};
+    let g=0,l=0;
+    for(let j=i-n+1;j<=i;j++){const diff=data[j].close-data[j-1].close; if(diff>0)g+=diff; else l-=diff;}
+    const rs=l===0?100:g/l;
+    return {...d, rsi:parseFloat((100-100/(1+rs)).toFixed(1))};
+  });
+}
+function calcStoch(data, k=14, d=3) {
+  return data.map((d2,i) => {
+    if(i<k-1) return {...d2, stochK:null, stochD:null};
+    const sl=data.slice(i-k+1,i+1);
+    const hh=Math.max(...sl.map(x=>x.high)), ll=Math.min(...sl.map(x=>x.low));
+    const kVal=hh===ll?50:parseFloat(((d2.close-ll)/(hh-ll)*100).toFixed(1));
+    const dSlice=[];
+    for(let j=Math.max(k-1,i-d+1);j<=i;j++){
+      const s2=data.slice(j-k+1,j+1);
+      const h2=Math.max(...s2.map(x=>x.high)),l2=Math.min(...s2.map(x=>x.low));
+      dSlice.push(h2===l2?50:(data[j].close-l2)/(h2-l2)*100);
+    }
+    const dVal=dSlice.length?parseFloat((dSlice.reduce((s,v)=>s+v,0)/dSlice.length).toFixed(1)):null;
+    return {...d2, stochK:kVal, stochD:dVal};
+  });
+}
+function applyIndicators(data) {
+  let d=calcMA(calcMA(data,5),25);
+  d=calcBB(d); d=calcMACD(d); d=calcRSI(d); d=calcStoch(d);
+  return d;
 }
 
-function DeadlineBadge({ dateStr, label }) {
-  if (!dateStr) return null;
-  const days = daysUntil(dateStr);
-  let bg="#e2e8f0", color="#475569";
-  if (days<0)       {bg="#fee2e2";color="#b91c1c";}
-  else if (days<=3) {bg="#fef3c7";color="#b45309";}
-  else if (days<=7) {bg="#fef9c3";color="#854d0e";}
+// ── ユーティリティ ──────────────────────────────────────
+function formatPrice(v, market) {
+  if(v==null) return "―";
+  return market==="JP"?`¥${Math.round(v).toLocaleString()}`:`$${v.toFixed(2)}`;
+}
+function fmtD(str) {
+  if(!str) return "";
+  const d=new Date(str); return `${d.getMonth()+1}/${d.getDate()}`;
+}
+
+const TT = ({active,payload,label,market}) => {
+  if(!active||!payload?.length) return null;
   return (
-    <span style={{background:bg,color,borderRadius:6,padding:"2px 8px",fontSize:11,fontWeight:600,marginRight:4}}>
-      {label} {formatDate(dateStr)}
-      <span style={{marginLeft:4,fontWeight:400}}>
-        {days<0?`(${Math.abs(days)}日超過)`:days===0?"(今日)":`(あと${days}日)`}
-      </span>
-    </span>
+    <div style={{background:"#1e293b",border:"1px solid #334155",borderRadius:8,padding:"8px 12px",fontSize:11}}>
+      <div style={{color:"#94a3b8",marginBottom:4}}>{label}</div>
+      {payload.map((p,i)=>p.value!=null&&(
+        <div key={i} style={{color:p.color||"#e2e8f0",fontWeight:600}}>
+          {p.name}: {p.value>10&&market?formatPrice(p.value,market):p.value}
+        </div>
+      ))}
+    </div>
   );
-}
+};
 
-function DateField({ label, value, onChange }) {
+function Signal({label,value,type}) {
+  const c={buy:"#22c55e",sell:"#ef4444",neutral:"#94a3b8"}[type];
   return (
-    <div style={{marginBottom:6}}>
-      <div style={{fontSize:11,color:"#94a3b8",marginBottom:2}}>{label}</div>
-      <div style={{display:"flex",gap:5,alignItems:"center"}}>
-        <input type="date" value={value} onChange={e=>onChange(e.target.value)}
-          style={{flex:1,border:"1px solid #e2e8f0",borderRadius:7,padding:"6px 8px",fontSize:13,outline:"none",fontFamily:"inherit"}}/>
-        {value && <button onClick={()=>onChange("")}
-          style={{background:"#fee2e2",border:"none",borderRadius:6,padding:"5px 9px",cursor:"pointer",color:"#b91c1c",fontWeight:700,fontSize:12}}>✕</button>}
-      </div>
+    <div style={{background:c+"22",border:`1px solid ${c}`,borderRadius:8,padding:"8px 10px",textAlign:"center"}}>
+      <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{label}</div>
+      <div style={{fontSize:11,fontWeight:700,color:c}}>{value}</div>
     </div>
   );
 }
 
-function PhaseForm({ phaseKey, phaseLabel, phaseColor, data, onChange }) {
-  const [open, setOpen] = useState(false);
-  const hasData = data.esDeadline || data.briefingDate || data.status !== "未着手" || data.memo;
+// ── メイン ──────────────────────────────────────────────
+export default function App() {
+  const [selected,  setSelected]  = useState(null);
+  const [periodIdx, setPeriodIdx] = useState(2);
+  const [rawData,   setRawData]   = useState([]);
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState("");
+  const [showMA5,   setShowMA5]   = useState(true);
+  const [showMA25,  setShowMA25]  = useState(true);
+  const [showBB,    setShowBB]    = useState(false);
+  const [panels,    setPanels]    = useState({macd:true,bb:false,vol:true,stoch:false,rsi:false});
+  const [aiComment, setAiComment] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [customSymbol, setCustomSymbol] = useState("");
+
+  const period = PERIODS[periodIdx];
+
+  // Alpha Vantage からデータ取得
+  const fetchStock = useCallback(async (preset) => {
+    if(!preset) return;
+    setLoading(true); setError(""); setRawData([]); setAiComment(null);
+    try {
+      const url = `https://www.alphavantage.co/query?function=${period.av}&symbol=${preset.symbol}&outputsize=${period.outputsize}&apikey=${API_KEY}`;
+      const res = await fetch(url);
+      if(!res.ok) throw new Error("取得失敗");
+      const json = await res.json();
+
+      // レート制限チェック
+      if(json.Note || json.Information) throw new Error("APIの1分あたりのリクエスト上限（5回）に達しました。1分後に再試行してください。");
+
+      const ts = json["Time Series (Daily)"];
+      if(!ts) throw new Error("データが見つかりません。ティッカーシンボルを確認してください。");
+
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - period.days);
+
+      const parsed = Object.entries(ts)
+        .map(([date, v]) => ({
+          date,
+          open:   parseFloat(v["1. open"]),
+          high:   parseFloat(v["2. high"]),
+          low:    parseFloat(v["3. low"]),
+          close:  parseFloat(v["4. close"]),
+          volume: parseInt(v["5. volume"]),
+        }))
+        .filter(d => new Date(d.date) >= cutoff)
+        .sort((a,b) => new Date(a.date)-new Date(b.date));
+
+      setRawData(parsed);
+    } catch(e) {
+      setError(e.message || "データ取得エラー");
+    } finally {
+      setLoading(false);
+    }
+  }, [period]);
+
+  useEffect(() => { if(selected) fetchStock(selected); }, [selected, periodIdx]);
+
+  const data = applyIndicators(rawData);
+  const first=data[0]?.close, last=data[data.length-1]?.close;
+  const change=first&&last?((last-first)/first*100):null;
+  const isUp=(change??0)>=0;
+  const minY=data.length?Math.min(...data.map(d=>d.bbLower??d.low))*0.995:0;
+  const maxY=data.length?Math.max(...data.map(d=>d.bbUpper??d.high))*1.005:0;
+
+  const latestRSI=data[data.length-1]?.rsi;
+  const latestMACD=data[data.length-1]?.macd;
+  const latestSig=data[data.length-1]?.macdSig;
+  const latestStochK=data[data.length-1]?.stochK;
+  const rsiSig=latestRSI>70?{v:"買われすぎ",t:"sell"}:latestRSI<30?{v:"売られすぎ",t:"buy"}:{v:"中立",t:"neutral"};
+  const macdSig=latestMACD>latestSig?{v:"上昇",t:"buy"}:{v:"下降",t:"sell"};
+  const stochSig=latestStochK>80?{v:"買われすぎ",t:"sell"}:latestStochK<20?{v:"売られすぎ",t:"buy"}:{v:"中立",t:"neutral"};
+  const trendSig=isUp?{v:"上昇",t:"buy"}:{v:"下降",t:"sell"};
+
+  async function fetchAiComment() {
+    if(!data.length||!selected) return;
+    setAiLoading(true); setAiComment(null);
+    const isBig=Math.abs(change??0)>=5;
+    const prompt=`株式テクニカル分析をJSON（マークダウン不要）で返してください。
+銘柄: ${selected.name} 期間: ${period.label} 騰落率: ${change?.toFixed(2)}%
+RSI: ${latestRSI} MACD: ${latestMACD?.toFixed(3)} シグナル: ${latestSig?.toFixed(3)} ストキャスK: ${latestStochK}
+${isBig?`大幅${isUp?"上昇":"下落"}の要因も時事的観点から説明してください。`:""}
+形式: {"summary":"総合分析150字","signals":["シグナル1","シグナル2","シグナル3"],"reasons":${isBig?'[{"title":"要因","detail":"説明"}]':'[]'},"outlook":"短期見通し50字","disclaimer":"※参考情報・投資助言ではありません"}`;
+    try {
+      const res=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,
+          tools:isBig?[{type:"web_search_20250305",name:"web_search"}]:undefined,
+          messages:[{role:"user",content:prompt}]}),
+      });
+      const json=await res.json();
+      const text=json.content?.map(b=>b.type==="text"?b.text:"").join("")||"";
+      try { setAiComment(JSON.parse(text.replace(/```json|```/g,"").trim())); }
+      catch { setAiComment({summary:text,signals:[],reasons:[],outlook:"",disclaimer:"※参考情報"}); }
+    } catch { setAiComment({summary:"取得失敗",signals:[],reasons:[],outlook:"",disclaimer:""}); }
+    finally { setAiLoading(false); }
+  }
+
+  const togglePanel=key=>setPanels(p=>({...p,[key]:!p[key]}));
+
+  function selectPreset(p) { setSelected(p); setAiComment(null); }
+  function searchCustom() {
+    if(!customSymbol.trim()) return;
+    const sym=customSymbol.trim().toUpperCase();
+    const market=sym.endsWith(".T")?"JP":"US";
+    const preset={label:sym,symbol:sym,market,name:sym};
+    setSelected(preset); setAiComment(null);
+  }
+
   return (
-    <div style={{border:`1.5px solid ${open?phaseColor:"#e2e8f0"}`,borderRadius:10,marginBottom:10,overflow:"hidden"}}>
-      <button onClick={()=>setOpen(!open)}
-        style={{width:"100%",background:open?phaseColor+"11":"#f8fafc",border:"none",padding:"10px 14px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <span style={{width:10,height:10,borderRadius:"50%",background:hasData?phaseColor:"#cbd5e1",display:"inline-block"}}/>
-          <span style={{fontWeight:700,fontSize:13,color:open?phaseColor:"#475569"}}>{phaseLabel}</span>
-          {!open && hasData && (
-            <span style={{fontSize:11,color:"#94a3b8"}}>
-              {data.esDeadline&&`ES ${formatDate(data.esDeadline)}`}
-              {data.esDeadline&&data.briefingDate&&" · "}
-              {data.briefingDate&&`説明会 ${formatDate(data.briefingDate)}`}
-              {" · "+data.status}
-            </span>
-          )}
+    <div style={{minHeight:"100vh",background:"#0f172a",color:"#e2e8f0",fontFamily:"'Hiragino Sans','Meiryo',sans-serif"}}>
+
+      {/* ヘッダー */}
+      <div style={{background:"#1e293b",borderBottom:"1px solid #334155",padding:"14px 20px"}}>
+        <div style={{fontSize:17,fontWeight:700,color:"#f1f5f9"}}>📈 株価テクニカル分析</div>
+        <div style={{fontSize:10,color:"#94a3b8",marginTop:2}}>実際の株価データ（Alpha Vantage）/ 投資助言ではありません</div>
+      </div>
+
+      {/* 検索 */}
+      <div style={{padding:"12px 20px",borderBottom:"1px solid #1e293b"}}>
+        <div style={{display:"flex",gap:6,marginBottom:10}}>
+          <input value={customSymbol} onChange={e=>setCustomSymbol(e.target.value.toUpperCase())}
+            onKeyDown={e=>e.key==="Enter"&&searchCustom()}
+            placeholder="ティッカー例: AAPL / 7203.T"
+            style={{flex:1,background:"#0f172a",border:"1px solid #334155",borderRadius:7,padding:"7px 10px",
+              color:"#f1f5f9",fontSize:13,outline:"none"}}/>
+          <button onClick={searchCustom}
+            style={{background:"#3b82f6",border:"none",borderRadius:7,padding:"7px 16px",
+              color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer"}}>検索</button>
         </div>
-        <span style={{color:"#94a3b8",fontSize:12}}>{open?"▲":"▼"}</span>
-      </button>
-      {open && (
-        <div style={{padding:"12px 14px",background:"#fff"}}>
-          <DateField label="ES締切日" value={data.esDeadline} onChange={v=>onChange({...data,esDeadline:v})}/>
-          <DateField label="説明会日程" value={data.briefingDate} onChange={v=>onChange({...data,briefingDate:v})}/>
-          <div style={{marginBottom:6}}>
-            <div style={{fontSize:11,color:"#94a3b8",marginBottom:2}}>選考ステータス</div>
-            <select value={data.status} onChange={e=>onChange({...data,status:e.target.value})}
-              style={{width:"100%",border:"1px solid #e2e8f0",borderRadius:7,padding:"6px 8px",fontSize:13,background:"#fff",outline:"none"}}>
-              {STATUS_OPTIONS.map(s=><option key={s}>{s}</option>)}
-            </select>
-          </div>
-          <div>
-            <div style={{fontSize:11,color:"#94a3b8",marginBottom:2}}>メモ</div>
-            <textarea value={data.memo} onChange={e=>onChange({...data,memo:e.target.value})} placeholder="備考など"
-              style={{width:"100%",border:"1px solid #e2e8f0",borderRadius:7,padding:"6px 8px",fontSize:13,resize:"vertical",height:56,boxSizing:"border-box",outline:"none",fontFamily:"inherit"}}/>
-          </div>
+        <div style={{fontSize:10,color:"#64748b",marginBottom:6}}>🇯🇵 日本株</div>
+        <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:8}}>
+          {PRESETS.filter(p=>p.market==="JP").map(p=>(
+            <button key={p.symbol} onClick={()=>selectPreset(p)}
+              style={{background:selected?.symbol===p.symbol?"#3b82f6":"#1e293b",border:"1px solid #334155",
+                borderRadius:6,padding:"5px 11px",color:selected?.symbol===p.symbol?"#fff":"#94a3b8",
+                fontSize:12,cursor:"pointer",fontWeight:600}}>{p.label}</button>
+          ))}
+        </div>
+        <div style={{fontSize:10,color:"#64748b",marginBottom:6}}>🇺🇸 米国株</div>
+        <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+          {PRESETS.filter(p=>p.market==="US").map(p=>(
+            <button key={p.symbol} onClick={()=>selectPreset(p)}
+              style={{background:selected?.symbol===p.symbol?"#3b82f6":"#1e293b",border:"1px solid #334155",
+                borderRadius:6,padding:"5px 11px",color:selected?.symbol===p.symbol?"#fff":"#94a3b8",
+                fontSize:12,cursor:"pointer",fontWeight:600}}>{p.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {!selected&&!loading&&(
+        <div style={{textAlign:"center",color:"#475569",marginTop:60}}>
+          <div style={{fontSize:40}}>📈</div>
+          <div style={{marginTop:12,fontSize:14}}>銘柄を選んでください</div>
+          <div style={{fontSize:11,marginTop:6,color:"#334155"}}>無料枠: 1分あたり5回・1日25回まで</div>
         </div>
       )}
-    </div>
-  );
-}
 
-// ── カレンダービュー ──────────────────────────────────────
-function CalendarView({ entries, onEdit }) {
-  const today = new Date();
-  const [year,  setYear]  = useState(today.getFullYear());
-  const [month, setMonth] = useState(today.getMonth());
+      {loading&&(
+        <div style={{textAlign:"center",color:"#64748b",padding:60,fontSize:14}}>
+          データ取得中...
+        </div>
+      )}
 
-  // その月のイベントをday→[{company,phase,type,color}]に変換
-  const eventMap = {};
-  entries.forEach(entry => {
-    PHASES.forEach(p => {
-      const d = entry[p.key];
-      if (!d) return;
-      [{key:"esDeadline",label:"ES締切"},{key:"briefingDate",label:"説明会"}].forEach(({key,label}) => {
-        const ds = d[key];
-        if (!ds) return;
-        const dt = new Date(ds);
-        if (dt.getFullYear()===year && dt.getMonth()===month) {
-          const day = dt.getDate();
-          if (!eventMap[day]) eventMap[day]=[];
-          eventMap[day].push({company:entry.company, phase:p.label, label, color:p.color, entry});
-        }
-      });
-    });
-  });
+      {error&&(
+        <div style={{margin:"16px 20px",background:"#450a0a",border:"1px solid #ef4444",borderRadius:10,
+          padding:14,color:"#fca5a5",fontSize:13,lineHeight:1.6}}>{error}</div>
+      )}
 
-  const firstDay = new Date(year, month, 1).getDay();
-  const daysInMonth = new Date(year, month+1, 0).getDate();
-  const cells = [];
-  for (let i=0;i<firstDay;i++) cells.push(null);
-  for (let d=1;d<=daysInMonth;d++) cells.push(d);
-  while (cells.length%7!==0) cells.push(null);
+      {data.length>0&&!loading&&(
+        <div style={{padding:"14px 20px"}}>
 
-  const prevMonth=()=>{ if(month===0){setYear(y=>y-1);setMonth(11);}else setMonth(m=>m-1); };
-  const nextMonth=()=>{ if(month===11){setYear(y=>y+1);setMonth(0);}else setMonth(m=>m+1); };
-  const isToday=(d)=> d && today.getFullYear()===year && today.getMonth()===month && today.getDate()===d;
-
-  return (
-    <div style={{padding:"16px 24px"}}>
-      {/* 月ナビ */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
-        <button onClick={prevMonth} style={navBtn}>＜</button>
-        <span style={{fontWeight:700,fontSize:17,color:"#1e293b"}}>{year}年 {month+1}月</span>
-        <button onClick={nextMonth} style={navBtn}>＞</button>
-      </div>
-
-      {/* 曜日ヘッダー */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:2}}>
-        {WEEKDAYS.map((w,i)=>(
-          <div key={w} style={{textAlign:"center",fontSize:12,fontWeight:700,padding:"4px 0",
-            color:i===0?"#ef4444":i===6?"#3b82f6":"#94a3b8"}}>
-            {w}
-          </div>
-        ))}
-      </div>
-
-      {/* 日付グリッド */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
-        {cells.map((day,idx)=>{
-          const events = day ? (eventMap[day]||[]) : [];
-          const dow = idx%7;
-          return (
-            <div key={idx} style={{
-              minHeight:72, background: day?(isToday(day)?"#eff6ff":"#fff"):"#f8fafc",
-              borderRadius:8, padding:"4px 5px",
-              border: isToday(day)?"1.5px solid #3b82f6":"1px solid #e2e8f0",
-            }}>
-              {day && (
-                <>
-                  <div style={{fontSize:12,fontWeight:isToday(day)?700:400,
-                    color:dow===0?"#ef4444":dow===6?"#3b82f6":isToday(day)?"#3b82f6":"#475569",
-                    marginBottom:3}}>
-                    {day}
-                  </div>
-                  {events.slice(0,3).map((ev,i)=>(
-                    <div key={i} onClick={()=>onEdit(ev.entry)}
-                      title={`${ev.company} [${ev.phase}] ${ev.label}`}
-                      style={{background:ev.color+"22",color:ev.color,borderRadius:4,
-                        fontSize:10,fontWeight:600,padding:"1px 4px",marginBottom:2,
-                        cursor:"pointer",overflow:"hidden",whiteSpace:"nowrap",textOverflow:"ellipsis"}}>
-                      {ev.label==="ES締切"?"📋":"📅"} {ev.company}
-                    </div>
-                  ))}
-                  {events.length>3 && (
-                    <div style={{fontSize:10,color:"#94a3b8"}}>+{events.length-3}件</div>
-                  )}
-                </>
+          {/* 価格 */}
+          <div style={{marginBottom:12}}>
+            <div style={{display:"flex",alignItems:"baseline",gap:8,flexWrap:"wrap"}}>
+              <span style={{fontSize:17,fontWeight:700}}>{selected.name}</span>
+              <span style={{fontSize:11,color:"#64748b"}}>{selected.symbol}</span>
+            </div>
+            <div style={{display:"flex",alignItems:"baseline",gap:10,marginTop:4}}>
+              <span style={{fontSize:26,fontWeight:700}}>{formatPrice(last,selected.market)}</span>
+              {change!==null&&(
+                <span style={{fontSize:14,fontWeight:700,color:isUp?"#22c55e":"#ef4444"}}>
+                  {isUp?"▲":"▼"} {Math.abs(change).toFixed(2)}%（{period.label}）
+                </span>
               )}
             </div>
-          );
-        })}
-      </div>
-
-      {/* 凡例 */}
-      <div style={{marginTop:14,display:"flex",gap:16,flexWrap:"wrap"}}>
-        <span style={{fontSize:11,color:"#64748b"}}>📋 ES締切　📅 説明会</span>
-        {PHASES.map(p=>(
-          <span key={p.key} style={{fontSize:11,display:"flex",alignItems:"center",gap:4}}>
-            <span style={{width:10,height:10,borderRadius:3,background:p.color,display:"inline-block"}}/>
-            <span style={{color:"#64748b"}}>{p.label}</span>
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const navBtn = {background:"#f1f5f9",border:"none",borderRadius:8,padding:"6px 16px",cursor:"pointer",fontSize:15,color:"#475569",fontWeight:700};
-
-// ── メイン ────────────────────────────────────────────────
-export default function App() {
-  const [entries, setEntries] = useState([]);
-  const [form, setForm] = useState(EMPTY_FORM);
-  const [editId, setEditId] = useState(null);
-  const [showForm, setShowForm] = useState(false);
-  const [search, setSearch] = useState("");
-  const [filterPhase, setFilterPhase] = useState("すべて");
-  const [filterStatus, setFilterStatus] = useState("すべて");
-  const [sortKey, setSortKey] = useState("esDeadline");
-  const [viewMode, setViewMode] = useState("list"); // "list" | "calendar"
-
-  useEffect(()=>{
-    try { const s=localStorage.getItem("shukatsu-tracker-v2"); if(s) setEntries(JSON.parse(s)); } catch{}
-  },[]);
-  useEffect(()=>{
-    try { localStorage.setItem("shukatsu-tracker-v2", JSON.stringify(entries)); } catch{}
-  },[entries]);
-
-  function handleSubmit() {
-    if (!form.company.trim()) return;
-    if (editId!==null) {
-      setEntries(entries.map(e=>e.id===editId?{...form,id:editId}:e));
-      setEditId(null);
-    } else {
-      setEntries([...entries,{...form,id:Date.now()}]);
-    }
-    setForm(EMPTY_FORM); setShowForm(false);
-  }
-  function handleEdit(entry) {
-    setForm({company:entry.company,summer:entry.summer||{...EMPTY_PHASE},winter:entry.winter||{...EMPTY_PHASE},honsen:entry.honsen||{...EMPTY_PHASE}});
-    setEditId(entry.id); setShowForm(true);
-  }
-  function handleDelete(id) {
-    if(window.confirm("削除しますか？")) setEntries(entries.filter(e=>e.id!==id));
-  }
-  function handleCancel() { setForm(EMPTY_FORM); setEditId(null); setShowForm(false); }
-
-  function getNextDeadline(entry) {
-    const dates=PHASES.map(p=>entry[p.key]?.esDeadline).filter(Boolean);
-    return dates.length ? dates.sort()[0] : null;
-  }
-
-  const filtered = entries.filter(e=>{
-    const ms=e.company.includes(search);
-    const mp=filterPhase==="すべて"||PHASES.some(p=>p.label===filterPhase&&(e[p.key]?.esDeadline||e[p.key]?.briefingDate||e[p.key]?.status!=="未着手"));
-    const mst=filterStatus==="すべて"||PHASES.some(p=>e[p.key]?.status===filterStatus);
-    return ms&&mp&&mst;
-  }).sort((a,b)=>{
-    if(sortKey==="esDeadline"){const da=getNextDeadline(a),db=getNextDeadline(b);if(!da)return 1;if(!db)return -1;return new Date(da)-new Date(db);}
-    return a.company.localeCompare(b.company,"ja");
-  });
-
-  const urgentCount=entries.filter(e=>PHASES.some(p=>{const d=daysUntil(e[p.key]?.esDeadline);return d!==null&&d>=0&&d<=7;})).length;
-
-  return (
-    <div style={{minHeight:"100vh",background:"#f8fafc",fontFamily:"'Hiragino Sans','Meiryo',sans-serif"}}>
-      {/* ヘッダー */}
-      <div style={{background:"#1e293b",padding:"18px 24px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div>
-          <div style={{color:"#fff",fontSize:20,fontWeight:700}}>就活トラッカー</div>
-          <div style={{color:"#94a3b8",fontSize:12,marginTop:2}}>
-            {entries.length}社登録中
-            {urgentCount>0&&<span style={{color:"#fbbf24",marginLeft:8}}>⚠️ {urgentCount}社が締切7日以内</span>}
           </div>
-        </div>
-        <button onClick={()=>{setShowForm(true);setEditId(null);setForm(EMPTY_FORM);}}
-          style={{background:"#3b82f6",color:"#fff",border:"none",borderRadius:8,padding:"10px 18px",fontWeight:700,fontSize:14,cursor:"pointer"}}>
-          ＋ 企業を追加
-        </button>
-      </div>
 
-      {/* フォームモーダル */}
-      {showForm && (
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",zIndex:100,display:"flex",alignItems:"flex-start",justifyContent:"center",overflowY:"auto",padding:"24px 0"}}>
-          <div style={{background:"#fff",borderRadius:14,padding:24,width:"min(500px,95vw)",boxShadow:"0 8px 40px rgba(0,0,0,0.18)"}}>
-            <div style={{fontSize:17,fontWeight:700,marginBottom:16,color:"#1e293b"}}>
-              {editId!==null?"企業情報を編集":"企業を追加"}
-            </div>
-            <div style={{marginBottom:14}}>
-              <label style={labelStyle}>企業名 *</label>
-              <input style={inputStyle} value={form.company} onChange={e=>setForm({...form,company:e.target.value})} placeholder="例：旭化成"/>
-            </div>
-            {PHASES.map(p=>(
-              <PhaseForm key={p.key} phaseKey={p.key} phaseLabel={p.label} phaseColor={p.color}
-                data={form[p.key]} onChange={v=>setForm({...form,[p.key]:v})}/>
+          {/* シグナル */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,marginBottom:14}}>
+            <Signal label="トレンド"   value={trendSig.v}  type={trendSig.t}/>
+            <Signal label="MACD"      value={macdSig.v}   type={macdSig.t}/>
+            <Signal label="RSI"       value={rsiSig.v}    type={rsiSig.t}/>
+            <Signal label="ストキャス" value={stochSig.v}  type={stochSig.t}/>
+          </div>
+
+          {/* 期間 */}
+          <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>
+            {PERIODS.map((p,i)=>(
+              <button key={p.label} onClick={()=>setPeriodIdx(i)}
+                style={{background:periodIdx===i?"#3b82f6":"#1e293b",border:"1px solid #334155",
+                  borderRadius:6,padding:"4px 12px",color:periodIdx===i?"#fff":"#94a3b8",
+                  fontSize:12,cursor:"pointer",fontWeight:600}}>{p.label}</button>
             ))}
-            <div style={{display:"flex",gap:10,marginTop:10}}>
-              <button onClick={handleSubmit} style={{flex:1,background:"#3b82f6",color:"#fff",border:"none",borderRadius:8,padding:"11px 0",fontWeight:700,cursor:"pointer",fontSize:15}}>
-                {editId!==null?"更新":"追加"}
-              </button>
-              <button onClick={handleCancel} style={{flex:1,background:"#f1f5f9",color:"#475569",border:"none",borderRadius:8,padding:"11px 0",fontWeight:600,cursor:"pointer",fontSize:15}}>
-                キャンセル
-              </button>
-            </div>
           </div>
-        </div>
-      )}
 
-      {/* フィルター & ビュー切替 */}
-      <div style={{padding:"12px 24px",display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",borderBottom:"1px solid #e2e8f0",background:"#fff"}}>
-        {/* ビュー切替 */}
-        <div style={{display:"flex",background:"#f1f5f9",borderRadius:8,padding:3,marginRight:4}}>
-          {[["list","☰ リスト"],["calendar","📅 カレンダー"]].map(([mode,label])=>(
-            <button key={mode} onClick={()=>setViewMode(mode)}
-              style={{background:viewMode===mode?"#fff":"transparent",border:"none",borderRadius:6,
-                padding:"5px 13px",cursor:"pointer",fontSize:12,fontWeight:700,
-                color:viewMode===mode?"#1e293b":"#94a3b8",boxShadow:viewMode===mode?"0 1px 3px rgba(0,0,0,0.1)":"none",transition:"all .15s"}}>
-              {label}
-            </button>
-          ))}
-        </div>
+          {/* チャートオプション */}
+          <div style={{display:"flex",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+            {[["MA5",showMA5,setShowMA5,"#f59e0b"],["MA25",showMA25,setShowMA25,"#8b5cf6"],["BB",showBB,setShowBB,"#a855f7"]].map(([lb,val,setter,color])=>(
+              <button key={lb} onClick={()=>setter(!val)}
+                style={{background:val?color+"33":"#1e293b",border:`1px solid ${val?color:"#334155"}`,
+                  borderRadius:6,padding:"3px 10px",color:val?color:"#64748b",fontSize:11,cursor:"pointer",fontWeight:700}}>
+                {lb}
+              </button>
+            ))}
+          </div>
 
-        {viewMode==="list" && <>
-          <input style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"7px 12px",fontSize:13,width:150,outline:"none"}}
-            placeholder="🔍 企業名で検索" value={search} onChange={e=>setSearch(e.target.value)}/>
-          <select style={filterStyle} value={filterPhase} onChange={e=>setFilterPhase(e.target.value)}>
-            <option>すべて</option>
-            {PHASES.map(p=><option key={p.key}>{p.label}</option>)}
-          </select>
-          <select style={filterStyle} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}>
-            <option>すべて</option>
-            {STATUS_OPTIONS.map(s=><option key={s}>{s}</option>)}
-          </select>
-          <select style={filterStyle} value={sortKey} onChange={e=>setSortKey(e.target.value)}>
-            <option value="esDeadline">ES締切順</option>
-            <option value="company">企業名順</option>
-          </select>
-          <span style={{color:"#94a3b8",fontSize:12,marginLeft:"auto"}}>{filtered.length}件</span>
-        </>}
-      </div>
+          {/* メインチャート */}
+          <div style={{background:"#1e293b",borderRadius:10,padding:"12px 6px 6px",marginBottom:8}}>
+            <div style={{fontSize:11,color:"#64748b",marginLeft:8,marginBottom:4}}>価格チャート（終値）</div>
+            <ResponsiveContainer width="100%" height={260}>
+              <ComposedChart data={data} margin={{top:4,right:14,left:0,bottom:4}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#334155"/>
+                <XAxis dataKey="date" tickFormatter={fmtD} tick={{fill:"#64748b",fontSize:10}} interval="preserveStartEnd"/>
+                <YAxis domain={[minY,maxY]} tick={{fill:"#64748b",fontSize:10}} width={68}
+                  tickFormatter={v=>selected.market==="JP"?`¥${Math.round(v).toLocaleString()}`:`$${v.toFixed(0)}`}/>
+                <Tooltip content={<TT market={selected.market}/>}/>
+                {showBB&&<>
+                  <Area type="monotone" dataKey="bbUpper" stroke="#a855f7" strokeWidth={1} fill="#a855f733" name="BB上限" dot={false}/>
+                  <Area type="monotone" dataKey="bbLower" stroke="#a855f7" strokeWidth={1} fill="#0f172a" name="BB下限" dot={false}/>
+                  <Line type="monotone" dataKey="bbMid" stroke="#a855f7" strokeWidth={1} strokeDasharray="3 2" dot={false} name="BB中央"/>
+                </>}
+                <Line type="monotone" dataKey="close" stroke={isUp?"#22c55e":"#ef4444"} strokeWidth={2} dot={false} name="終値"/>
+                {showMA5  &&<Line type="monotone" dataKey="ma5"  stroke="#f59e0b" strokeWidth={1.5} dot={false} strokeDasharray="4 2" name="MA5"/>}
+                {showMA25 &&<Line type="monotone" dataKey="ma25" stroke="#8b5cf6" strokeWidth={1.5} dot={false} strokeDasharray="4 2" name="MA25"/>}
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
 
-      {/* コンテンツ */}
-      {viewMode==="calendar" ? (
-        <CalendarView entries={entries} onEdit={handleEdit}/>
-      ) : (
-        <div style={{padding:"16px 24px",display:"flex",flexDirection:"column",gap:10}}>
-          {filtered.length===0 && (
-            <div style={{textAlign:"center",color:"#94a3b8",marginTop:60,fontSize:15}}>
-              {entries.length===0?"「＋ 企業を追加」から登録してみましょう":"該当する企業が見つかりません"}
+          {/* パネル切替 */}
+          <div style={{display:"flex",gap:5,marginBottom:8,flexWrap:"wrap"}}>
+            {PANELS.map(p=>(
+              <button key={p.key} onClick={()=>togglePanel(p.key)}
+                style={{background:panels[p.key]?p.color+"33":"#1e293b",border:`1px solid ${panels[p.key]?p.color:"#334155"}`,
+                  borderRadius:6,padding:"3px 10px",color:panels[p.key]?p.color:"#64748b",fontSize:11,cursor:"pointer",fontWeight:700}}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          {/* MACDパネル */}
+          {panels.macd&&(
+            <div style={{background:"#1e293b",borderRadius:10,padding:"12px 6px 6px",marginBottom:8}}>
+              <div style={{fontSize:11,color:"#3b82f6",marginLeft:8,marginBottom:4,fontWeight:700}}>MACD (12,26,9)</div>
+              <ResponsiveContainer width="100%" height={110}>
+                <ComposedChart data={data} margin={{top:4,right:14,left:0,bottom:4}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#334155"/>
+                  <XAxis dataKey="date" tickFormatter={fmtD} tick={{fill:"#64748b",fontSize:9}} interval="preserveStartEnd"/>
+                  <YAxis tick={{fill:"#64748b",fontSize:9}} width={36}/>
+                  <Tooltip content={<TT/>}/>
+                  <ReferenceLine y={0} stroke="#475569"/>
+                  <Bar dataKey="macdHist" name="ヒストグラム">
+                    {data.map((d,i)=><cell key={i} fill={(d.macdHist??0)>=0?"#22c55e":"#ef4444"}/>)}
+                  </Bar>
+                  <Line type="monotone" dataKey="macd"    stroke="#f59e0b" strokeWidth={1.5} dot={false} name="MACD"/>
+                  <Line type="monotone" dataKey="macdSig" stroke="#ef4444" strokeWidth={1.5} dot={false} name="シグナル"/>
+                </ComposedChart>
+              </ResponsiveContainer>
             </div>
           )}
-          {filtered.map(entry=>(
-            <div key={entry.id} style={{background:"#fff",borderRadius:12,padding:"14px 18px",boxShadow:"0 1px 4px rgba(0,0,0,0.07)"}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:10}}>
-                <span style={{fontSize:16,fontWeight:700,color:"#1e293b"}}>{entry.company}</span>
-                <div style={{display:"flex",gap:7}}>
-                  <button onClick={()=>handleEdit(entry)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"5px 13px",cursor:"pointer",fontSize:13,color:"#475569",fontWeight:600}}>編集</button>
-                  <button onClick={()=>handleDelete(entry.id)} style={{background:"#fee2e2",border:"none",borderRadius:7,padding:"5px 13px",cursor:"pointer",fontSize:13,color:"#b91c1c",fontWeight:600}}>削除</button>
-                </div>
-              </div>
-              <div style={{display:"flex",flexDirection:"column",gap:7}}>
-                {PHASES.map(p=>{
-                  const d=entry[p.key];
-                  const hasAny=d&&(d.esDeadline||d.briefingDate||d.status!=="未着手"||d.memo);
-                  if(!hasAny) return null;
-                  return (
-                    <div key={p.key} style={{background:"#f8fafc",borderRadius:8,padding:"8px 12px",borderLeft:`3px solid ${p.color}`}}>
-                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}>
-                        <span style={{fontSize:12,fontWeight:700,color:p.color}}>{p.label}</span>
-                        <span style={{background:(STATUS_COLORS[d.status]||"#94a3b8")+"22",color:STATUS_COLORS[d.status]||"#94a3b8",borderRadius:5,padding:"1px 8px",fontSize:11,fontWeight:600}}>
-                          {d.status}
-                        </span>
-                      </div>
-                      <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
-                        <DeadlineBadge dateStr={d.esDeadline} label="ES締切"/>
-                        <DeadlineBadge dateStr={d.briefingDate} label="説明会"/>
-                      </div>
-                      {d.memo&&<div style={{marginTop:5,color:"#64748b",fontSize:12}}>📝 {d.memo}</div>}
-                    </div>
-                  );
-                })}
-              </div>
+
+          {/* BBパネル */}
+          {panels.bb&&(
+            <div style={{background:"#1e293b",borderRadius:10,padding:"12px 6px 6px",marginBottom:8}}>
+              <div style={{fontSize:11,color:"#8b5cf6",marginLeft:8,marginBottom:4,fontWeight:700}}>ボリンジャーバンド（±2σ）</div>
+              <ResponsiveContainer width="100%" height={110}>
+                <AreaChart data={data} margin={{top:4,right:14,left:0,bottom:4}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#334155"/>
+                  <XAxis dataKey="date" tickFormatter={fmtD} tick={{fill:"#64748b",fontSize:9}} interval="preserveStartEnd"/>
+                  <YAxis tick={{fill:"#64748b",fontSize:9}} width={68}
+                    tickFormatter={v=>selected.market==="JP"?`¥${Math.round(v).toLocaleString()}`:`$${v.toFixed(0)}`}/>
+                  <Tooltip content={<TT market={selected.market}/>}/>
+                  <Area type="monotone" dataKey="bbUpper" stroke="#a855f7" fill="#a855f722" strokeWidth={1.5} name="上限"/>
+                  <Area type="monotone" dataKey="bbLower" stroke="#a855f7" fill="#0f172a" strokeWidth={1.5} name="下限"/>
+                  <Line type="monotone" dataKey="close" stroke="#e2e8f0" strokeWidth={1} dot={false} name="終値"/>
+                </AreaChart>
+              </ResponsiveContainer>
             </div>
-          ))}
+          )}
+
+          {/* 出来高パネル */}
+          {panels.vol&&(
+            <div style={{background:"#1e293b",borderRadius:10,padding:"12px 6px 6px",marginBottom:8}}>
+              <div style={{fontSize:11,color:"#10b981",marginLeft:8,marginBottom:4,fontWeight:700}}>出来高</div>
+              <ResponsiveContainer width="100%" height={90}>
+                <BarChart data={data} margin={{top:4,right:14,left:0,bottom:4}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#334155"/>
+                  <XAxis dataKey="date" tickFormatter={fmtD} tick={{fill:"#64748b",fontSize:9}} interval="preserveStartEnd"/>
+                  <YAxis tick={{fill:"#64748b",fontSize:9}} width={40} tickFormatter={v=>`${(v/1000000).toFixed(0)}M`}/>
+                  <Tooltip content={<TT/>}/>
+                  <Bar dataKey="volume" name="出来高" fill="#10b981" opacity={0.7}/>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {/* ストキャスパネル */}
+          {panels.stoch&&(
+            <div style={{background:"#1e293b",borderRadius:10,padding:"12px 6px 6px",marginBottom:8}}>
+              <div style={{fontSize:11,color:"#f97316",marginLeft:8,marginBottom:4,fontWeight:700}}>ストキャスティクス (14,3)</div>
+              <ResponsiveContainer width="100%" height={100}>
+                <LineChart data={data} margin={{top:4,right:14,left:0,bottom:4}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#334155"/>
+                  <XAxis dataKey="date" tickFormatter={fmtD} tick={{fill:"#64748b",fontSize:9}} interval="preserveStartEnd"/>
+                  <YAxis domain={[0,100]} tick={{fill:"#64748b",fontSize:9}} width={28}/>
+                  <Tooltip content={<TT/>}/>
+                  <ReferenceLine y={80} stroke="#ef4444" strokeDasharray="3 3"/>
+                  <ReferenceLine y={20} stroke="#22c55e" strokeDasharray="3 3"/>
+                  <Line type="monotone" dataKey="stochK" stroke="#f97316" strokeWidth={1.5} dot={false} name="%K"/>
+                  <Line type="monotone" dataKey="stochD" stroke="#fbbf24" strokeWidth={1.5} dot={false} name="%D" strokeDasharray="3 2"/>
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {/* RSIパネル */}
+          {panels.rsi&&(
+            <div style={{background:"#1e293b",borderRadius:10,padding:"12px 6px 6px",marginBottom:8}}>
+              <div style={{fontSize:11,color:"#06b6d4",marginLeft:8,marginBottom:4,fontWeight:700}}>RSI (14)</div>
+              <ResponsiveContainer width="100%" height={100}>
+                <LineChart data={data} margin={{top:4,right:14,left:0,bottom:4}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#334155"/>
+                  <XAxis dataKey="date" tickFormatter={fmtD} tick={{fill:"#64748b",fontSize:9}} interval="preserveStartEnd"/>
+                  <YAxis domain={[0,100]} tick={{fill:"#64748b",fontSize:9}} width={28}/>
+                  <Tooltip content={<TT/>}/>
+                  <ReferenceLine y={70} stroke="#ef4444" strokeDasharray="3 3"/>
+                  <ReferenceLine y={30} stroke="#22c55e" strokeDasharray="3 3"/>
+                  <Line type="monotone" dataKey="rsi" stroke="#06b6d4" strokeWidth={1.5} dot={false} name="RSI"/>
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {/* AI分析 */}
+          <div style={{background:"#1e293b",borderRadius:10,padding:14}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+              <span style={{fontSize:13,fontWeight:700,color:"#94a3b8"}}>🤖 AI総合分析</span>
+              <button onClick={fetchAiComment} disabled={aiLoading}
+                style={{background:aiLoading?"#1e293b":"#3b82f6",border:"1px solid #3b82f6",
+                  borderRadius:7,padding:"5px 14px",color:aiLoading?"#64748b":"#fff",
+                  fontSize:12,cursor:aiLoading?"default":"pointer",fontWeight:700}}>
+                {aiLoading?"分析中...":"分析する"}
+              </button>
+            </div>
+            {aiComment?(
+              <div>
+                <p style={{fontSize:13,color:"#cbd5e1",lineHeight:1.7,margin:"0 0 10px"}}>{aiComment.summary}</p>
+                {aiComment.signals?.length>0&&(
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,color:"#64748b",marginBottom:6,fontWeight:700}}>📊 シグナル</div>
+                    {aiComment.signals.map((s,i)=>(
+                      <div key={i} style={{background:"#0f172a",borderRadius:6,padding:"5px 10px",marginBottom:4,fontSize:12,color:"#94a3b8"}}>• {s}</div>
+                    ))}
+                  </div>
+                )}
+                {aiComment.reasons?.length>0&&(
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,color:"#64748b",marginBottom:6,fontWeight:700}}>📰 変動要因</div>
+                    {aiComment.reasons.map((r,i)=>(
+                      <div key={i} style={{background:"#0f172a",borderRadius:6,padding:"7px 10px",marginBottom:5,borderLeft:"3px solid #3b82f6"}}>
+                        <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>{r.title}</div>
+                        <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>{r.detail}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {aiComment.outlook&&(
+                  <div style={{background:"#0f172a",borderRadius:6,padding:"7px 10px",marginBottom:8}}>
+                    <div style={{fontSize:11,color:"#64748b",marginBottom:2}}>📅 短期見通し</div>
+                    <div style={{fontSize:12,color:"#e2e8f0"}}>{aiComment.outlook}</div>
+                  </div>
+                )}
+                <p style={{fontSize:10,color:"#475569",margin:0}}>{aiComment.disclaimer}</p>
+              </div>
+            ):(
+              <p style={{fontSize:12,color:"#475569",margin:0}}>「分析する」を押すとAIが総合分析します。</p>
+            )}
+            <div style={{marginTop:10,padding:"6px 10px",background:"#0f172a",borderRadius:6,fontSize:10,color:"#475569"}}>
+              ⚠️ 参考情報のみ。実際の投資判断はご自身の責任で行ってください。
+            </div>
+          </div>
         </div>
       )}
     </div>
   );
 }
-
-const labelStyle = {display:"block",fontSize:13,fontWeight:600,color:"#475569",marginBottom:4};
-const inputStyle  = {width:"100%",border:"1px solid #e2e8f0",borderRadius:8,padding:"9px 11px",fontSize:14,boxSizing:"border-box",outline:"none",fontFamily:"inherit"};
-const filterStyle = {border:"1px solid #e2e8f0",borderRadius:8,padding:"7px 10px",fontSize:13,background:"#fff",cursor:"pointer"};
